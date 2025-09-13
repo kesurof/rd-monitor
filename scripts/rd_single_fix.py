@@ -71,23 +71,42 @@ class RealDebridClient:
         if data is not None:
             # If calling selectFiles endpoint, prefer multipart/form-data with repeated files[] parts
             if '/torrents/selectFiles/' in path and any(k.endswith('[]') for k in data.keys()):
-                boundary = f'----rdsf-{int(time.time())}'
-                lines: List[bytes] = []
-                for k, v in data.items():
-                    if isinstance(v, (list, tuple)):
-                        for item in v:
+                # Some APIs expect JSON payloads like {"files": [1,2,...]}.
+                # Try sending JSON first (simpler), falling back to multipart if needed.
+                try:
+                    files_list = []
+                    for k, v in data.items():
+                        if isinstance(v, (list, tuple)):
+                            files_list.extend([int(x) for x in v])
+                        else:
+                            files_list.append(int(v))
+                except Exception:
+                    files_list = [str(x) for k, v in data.items() for x in (v if isinstance(v, (list, tuple)) else [v])]
+
+                # prepare JSON body
+                try:
+                    json_body = json.dumps({'files': files_list}, ensure_ascii=False).encode('utf-8')
+                    body = json_body
+                    hdrs.setdefault('Content-Type', 'application/json')
+                except Exception:
+                    # fallback to multipart/form-data if JSON serialization fails
+                    boundary = f'----rdsf-{int(time.time())}'
+                    lines: List[bytes] = []
+                    for k, v in data.items():
+                        if isinstance(v, (list, tuple)):
+                            for item in v:
+                                lines.append(f'--{boundary}'.encode('utf-8'))
+                                lines.append(f'Content-Disposition: form-data; name="{k}"'.encode('utf-8'))
+                                lines.append(b'')
+                                lines.append(str(item).encode('utf-8'))
+                        else:
                             lines.append(f'--{boundary}'.encode('utf-8'))
                             lines.append(f'Content-Disposition: form-data; name="{k}"'.encode('utf-8'))
                             lines.append(b'')
-                            lines.append(str(item).encode('utf-8'))
-                    else:
-                        lines.append(f'--{boundary}'.encode('utf-8'))
-                        lines.append(f'Content-Disposition: form-data; name="{k}"'.encode('utf-8'))
-                        lines.append(b'')
-                        lines.append(str(v).encode('utf-8'))
-                lines.append(f'--{boundary}--'.encode('utf-8'))
-                body = b'\r\n'.join(lines) + b'\r\n'
-                hdrs.setdefault('Content-Type', f'multipart/form-data; boundary={boundary}')
+                            lines.append(str(v).encode('utf-8'))
+                    lines.append(f'--{boundary}--'.encode('utf-8'))
+                    body = b'\r\n'.join(lines) + b'\r\n'
+                    hdrs.setdefault('Content-Type', f'multipart/form-data; boundary={boundary}')
             else:
                 # Fallback to application/x-www-form-urlencoded preserving literal bracket keys
                 parts: List[str] = []
