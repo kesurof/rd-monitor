@@ -612,6 +612,8 @@ def build_arg_parser():
     p.add_argument('--info-cache-ttl', type=int, default=300, help='Seconds to cache torrent info in memory')
     p.add_argument('--collect-ids', help='Path to write candidate ids (one per line). Only collect, do not select')
     p.add_argument('--process-ids', help='Path to read candidate ids (one per line) and process them slowly')
+    p.add_argument('--enqueue', action='store_true', help='When used with --process-ids, enqueue ids into --persist DB instead of immediate select')
+    p.add_argument('--process-delay', type=int, default=60, help='Seconds spacing when enqueuing ids (used with --enqueue)')
     p.add_argument('--once', action='store_true', help='Run a single scan then exit')
     p.add_argument('--daemon', action='store_true', help='Run in daemon mode with persistence and backoff')
     p.add_argument('--cycle-interval', type=int, default=3600, help='Seconds between cycles when daemon')
@@ -681,6 +683,18 @@ def main(argv=None):
             with open(path, 'r', encoding='utf-8') as fh:
                 ids = [line.strip() for line in fh if line.strip()]
             log.info('Processing %s ids from %s', len(ids), path)
+            if args.enqueue:
+                if not args.persist:
+                    log.error('--enqueue requires --persist <db_path> to be set')
+                    return 2
+                # enqueue ids spaced by process_delay
+                now = int(time.time())
+                for i, tid in enumerate(ids):
+                    next_try = now + i * args.process_delay
+                    add_retry(args.persist, tid, {'collected': True}, attempts=0, next_try=next_try)
+                log.info('Enqueued %s ids into %s with spacing %ss', len(ids), args.persist, args.process_delay)
+                return 0
+
             for tid in ids:
                 try:
                     info = client.get_torrent_info(tid)
