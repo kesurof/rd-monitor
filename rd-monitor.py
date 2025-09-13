@@ -17,6 +17,8 @@ from rd_lib.rd_async import fetch_all_torrents
 import json
 import asyncio
 from pathlib import Path
+import sqlite3
+from typing import Any, Dict
 
 
 # simple upsert helpers: write JSONL to data/ for persistence
@@ -33,11 +35,53 @@ def upsert_torrent_sync(t: dict):
         f.write(json.dumps(t, ensure_ascii=False) + "\n")
 
 
+DB_PATH = DATA_DIR / "torrents.db"
+
+
+def init_db() -> None:
+    con = sqlite3.connect(str(DB_PATH))
+    cur = con.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS torrents (
+            id TEXT PRIMARY KEY,
+            data TEXT NOT NULL
+        )
+        """
+    )
+    con.commit()
+    con.close()
+
+
+def upsert_torrent_db(t: Dict[str, Any]) -> None:
+    """Synchronous upsert into sqlite DB (called in executor)."""
+    con = sqlite3.connect(str(DB_PATH))
+    cur = con.cursor()
+    tid = t.get("id") or t.get("hash") or t.get("_id")
+    if not tid:
+        # fallback: write to jsonl
+        p = DATA_DIR / "torrents_malformed.jsonl"
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(t, ensure_ascii=False) + "\n")
+        con.close()
+        return
+    cur.execute("INSERT OR REPLACE INTO torrents (id, data) VALUES (?, ?)", (str(tid), json.dumps(t, ensure_ascii=False)))
+    con.commit()
+    con.close()
+
+
+async def upsert_torrent_async(t: Dict[str, Any]) -> None:
+    """Async wrapper: run the sync DB upsert in an executor to avoid blocking the loop."""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, upsert_torrent_db, t)
+
+
 async def _run_fetch_all(token: str, max_pages: int = None):
-    async with asyncio.Semaphore(1):
-        async with aiohttp.ClientSession() as session:
-            total = await fetch_all_torrents(token, upsert_torrent_sync, session=session, max_pages=max_pages)
-            return total
+    # initialize DB
+    init_db()
+    async with aiohttp.ClientSession() as session:
+        total = await fetch_all_torrents(token, upsert_torrent_async, session=session, max_pages=max_pages)
+        return total
 
 
 def fetch_all_sync(token: str, max_pages: int = None):
