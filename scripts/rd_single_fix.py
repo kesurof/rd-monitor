@@ -28,9 +28,10 @@ import sys
 import time
 from typing import Dict, List, Optional
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import urllib.request
+import urllib.error
+import urllib.parse
+import socket
 
 DEFAULT_VIDEO_EXTS = ['.mkv', '.mp4', '.avi', '.mov', '.m4v']
 
@@ -50,26 +51,66 @@ class RealDebridClient:
     def __init__(self, token: str, timeout: int = 30):
         self.token = token
         self.base = 'https://api.real-debrid.com/rest/1.0'
-        self.s = requests.Session()
-        retries = Retry(total=3, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504))
-        self.s.mount('https://', HTTPAdapter(max_retries=retries))
-        self.s.headers.update({'Authorization': f'Bearer {self.token}'})
         self.timeout = timeout
 
-    def _request(self, method: str, path: str, **kwargs):
+    def _request(self, method: str, path: str, data: Optional[dict] = None, headers: Optional[dict] = None):
         url = f'{self.base}{path}'
-        resp = self.s.request(method, url, timeout=self.timeout, **kwargs)
-        if resp.status_code == 429:
-            # respect Retry-After if present
-            ra = resp.headers.get('Retry-After')
-            raise RateLimitError('429', retry_after=int(ra) if ra and ra.isdigit() else None)
-        if resp.status_code == 509:
-            raise RateLimitError('509')
-        resp.raise_for_status()
-        try:
-            return resp.json()
-        except ValueError:
-            return resp.text
+        hdrs = {'Authorization': f'Bearer {self.token}', 'User-Agent': 'rd-single-fix/1.0'}
+        if headers:
+            hdrs.update(headers)
+
+        body = None
+        if data is not None:
+            # Encode form data supporting multiple values per key
+            body = urllib.parse.urlencode(data, doseq=True).encode('utf-8')
+            hdrs.setdefault('Content-Type', 'application/x-www-form-urlencoded')
+
+        attempts = 0
+        max_attempts = 3
+        while True:
+            attempts += 1
+            req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    status = resp.getcode()
+                    info = resp.info()
+                    text = resp.read().decode('utf-8')
+            except urllib.error.HTTPError as e:
+                status = e.code
+                info = e.headers
+                try:
+                    text = e.read().decode('utf-8')
+                except Exception:
+                    text = ''
+            except (urllib.error.URLError, socket.timeout) as e:
+                # transient network error -> retry
+                if attempts < max_attempts:
+                    time.sleep(1 * attempts)
+                    continue
+                raise
+
+            # handle rate limits
+            if status == 429:
+                ra = info.get('Retry-After') if info is not None else None
+                retry_after = int(ra) if ra and ra.isdigit() else None
+                raise RateLimitError('429', retry_after=retry_after)
+            if status == 509:
+                raise RateLimitError('509')
+
+            if status >= 500 and attempts < max_attempts:
+                # server error: retry a few times
+                time.sleep(1 * attempts)
+                continue
+
+            if status >= 400:
+                # raise a simple error with details
+                raise Exception(f'HTTP {status} returned: {text}')
+
+            # try to parse JSON
+            try:
+                return json.loads(text)
+            except ValueError:
+                return text
 
     def get_torrents(self, page: int = 1, limit: int = 100):
         return self._request('GET', f'/torrents?page={page}&limit={limit}')
