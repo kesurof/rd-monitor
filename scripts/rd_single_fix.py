@@ -61,8 +61,22 @@ class RealDebridClient:
 
         body = None
         if data is not None:
-            # Encode form data supporting multiple values per key
-            body = urllib.parse.urlencode(data, doseq=True).encode('utf-8')
+            # Encode form data supporting multiple values per key.
+            # Preserve literal 'files[]' key (do not percent-encode brackets) because some APIs expect it.
+            parts: List[str] = []
+            for k, v in data.items():
+                if isinstance(v, (list, tuple)):
+                    for item in v:
+                        if k.endswith('[]'):
+                            parts.append(f"{k}={urllib.parse.quote_plus(str(item))}")
+                        else:
+                            parts.append(f"{urllib.parse.quote_plus(str(k))}={urllib.parse.quote_plus(str(item))}")
+                else:
+                    if k.endswith('[]'):
+                        parts.append(f"{k}={urllib.parse.quote_plus(str(v))}")
+                    else:
+                        parts.append(f"{urllib.parse.quote_plus(str(k))}={urllib.parse.quote_plus(str(v))}")
+            body = '&'.join(parts).encode('utf-8')
             hdrs.setdefault('Content-Type', 'application/x-www-form-urlencoded')
 
         attempts = 0
