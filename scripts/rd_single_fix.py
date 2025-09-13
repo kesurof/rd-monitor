@@ -69,23 +69,42 @@ class RealDebridClient:
 
         body = None
         if data is not None:
-            # Encode form data supporting multiple values per key.
-            # Preserve literal 'files[]' key (do not percent-encode brackets) because some APIs expect it.
-            parts: List[str] = []
-            for k, v in data.items():
-                if isinstance(v, (list, tuple)):
-                    for item in v:
-                        if k.endswith('[]'):
-                            parts.append(f"{k}={urllib.parse.quote_plus(str(item))}")
-                        else:
-                            parts.append(f"{urllib.parse.quote_plus(str(k))}={urllib.parse.quote_plus(str(item))}")
-                else:
-                    if k.endswith('[]'):
-                        parts.append(f"{k}={urllib.parse.quote_plus(str(v))}")
+            # If calling selectFiles endpoint, prefer multipart/form-data with repeated files[] parts
+            if '/torrents/selectFiles/' in path and any(k.endswith('[]') for k in data.keys()):
+                boundary = f'----rdsf-{int(time.time())}'
+                lines: List[bytes] = []
+                for k, v in data.items():
+                    if isinstance(v, (list, tuple)):
+                        for item in v:
+                            lines.append(f'--{boundary}'.encode('utf-8'))
+                            lines.append(f'Content-Disposition: form-data; name="{k}"'.encode('utf-8'))
+                            lines.append(b'')
+                            lines.append(str(item).encode('utf-8'))
                     else:
-                        parts.append(f"{urllib.parse.quote_plus(str(k))}={urllib.parse.quote_plus(str(v))}")
-            body = '&'.join(parts).encode('utf-8')
-            hdrs.setdefault('Content-Type', 'application/x-www-form-urlencoded')
+                        lines.append(f'--{boundary}'.encode('utf-8'))
+                        lines.append(f'Content-Disposition: form-data; name="{k}"'.encode('utf-8'))
+                        lines.append(b'')
+                        lines.append(str(v).encode('utf-8'))
+                lines.append(f'--{boundary}--'.encode('utf-8'))
+                body = b'\r\n'.join(lines) + b'\r\n'
+                hdrs.setdefault('Content-Type', f'multipart/form-data; boundary={boundary}')
+            else:
+                # Fallback to application/x-www-form-urlencoded preserving literal bracket keys
+                parts: List[str] = []
+                for k, v in data.items():
+                    if isinstance(v, (list, tuple)):
+                        for item in v:
+                            if k.endswith('[]'):
+                                parts.append(f"{k}={urllib.parse.quote_plus(str(item))}")
+                            else:
+                                parts.append(f"{urllib.parse.quote_plus(str(k))}={urllib.parse.quote_plus(str(item))}")
+                    else:
+                        if k.endswith('[]'):
+                            parts.append(f"{k}={urllib.parse.quote_plus(str(v))}")
+                        else:
+                            parts.append(f"{urllib.parse.quote_plus(str(k))}={urllib.parse.quote_plus(str(v))}")
+                body = '&'.join(parts).encode('utf-8')
+                hdrs.setdefault('Content-Type', 'application/x-www-form-urlencoded')
 
         attempts = 0
         max_attempts = 3
