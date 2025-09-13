@@ -683,13 +683,15 @@ def run_cycle(client: RealDebridClient, cfg: Dict, pause: float, page_limit: int
                 remove_retry(persist_db, tid)
             except RateLimitError as e:
                 attempts = item['attempts'] + 1
-                back = compute_backoff(attempts)
+                # use a slightly larger backoff for rate limits
+                back = compute_backoff(attempts, base=60, factor=3)
                 next_try = int(time.time()) + back
                 log.warning('[retry] rate limited selecting %s, scheduling next_try in %s', tid, back)
                 update_retry(persist_db, tid, item['payload'], attempts, next_try)
             except Exception as e:
                 attempts = item['attempts'] + 1
-                back = compute_backoff(attempts)
+                # on generic errors (503 etc) use larger backoff
+                back = compute_backoff(attempts, base=60, factor=3)
                 next_try = int(time.time()) + back
                 log.error('[retry] error selecting files for %s: %s, scheduling next_try %s', tid, e, back)
                 update_retry(persist_db, tid, item['payload'], attempts, next_try)
@@ -825,6 +827,7 @@ def build_arg_parser():
     p.add_argument('--enqueue', action='store_true', help='When used with --process-ids, enqueue ids into --persist DB instead of immediate select')
     p.add_argument('--process-delay', type=int, default=60, help='Seconds spacing when enqueuing ids (used with --enqueue)')
     p.add_argument('--max-selects-per-minute', type=int, default=60, help='Global cap of select_files calls per minute (0 = no cap)')
+    p.add_argument('--worker', action='store_true', help='Run dedicated queue consumer: pop one due item and process it, sleep --process-delay between items')
     p.add_argument('--list-queue', action='store_true', help='List entries in the sqlite retry queue and exit')
     p.add_argument('--once', action='store_true', help='Run a single scan then exit')
     p.add_argument('--daemon', action='store_true', help='Run in daemon mode with persistence and backoff')
@@ -853,8 +856,73 @@ def main(argv=None):
     page_limit = args.page_limit
     max_pages = None if args.max_pages <= 0 else args.max_pages
     max_per_cycle = None if args.max_per_cycle <= 0 else args.max_per_cycle
+    max_selects_per_minute = args.max_selects_per_minute
+    info_pause = args.info_pause
+    info_cache_ttl = args.info_cache_ttl
 
     client = RealDebridClient(token)
+    # configure token-bucket for selects if requested
+    try:
+        # Dedicated queue worker mode: consumes one retry at a time at steady rate
+        if args.worker:
+            if not args.persist:
+                log.error('--worker requires --persist <db_path>')
+                return 2
+            init_db(args.persist)
+            log.info('Starting dedicated worker: processing one job every %ss', args.process_delay)
+            while True:
+                due = pop_due(args.persist, max_n=1)
+                if not due:
+                    time.sleep(1)
+                    continue
+                item = due[0]
+                tid = item['id']
+                attempts = item['attempts'] + 1
+                log.info('[worker] trying %s (attempt %s)', tid, attempts)
+                try:
+                    info = client.get_torrent_info(tid)
+                except RateLimitError as e:
+                    ra = e.retry_after or 60
+                    log.warning('[worker] rate limited when getting info %s, sleeping %s', tid, ra)
+                    # reschedule
+                    back = compute_backoff(attempts)
+                    update_retry(args.persist, tid, item['payload'], attempts, int(time.time()) + back)
+                    time.sleep(ra)
+                    continue
+                except Exception as e:
+                    log.error('[worker] error getting info %s: %s', tid, e)
+                    back = compute_backoff(attempts)
+                    update_retry(args.persist, tid, item['payload'], attempts, int(time.time()) + back)
+                    time.sleep(args.process_delay)
+                    continue
+
+                ids = find_video_file_ids(info, video_exts, include_subs)
+                if not ids:
+                    log.info('[worker] no video files for %s, removing retry', tid)
+                    remove_retry(args.persist, tid)
+                    time.sleep(args.process_delay)
+                    continue
+
+                try:
+                    client.select_files(tid, ids)
+                    log.info('[worker] selected files for %s', tid)
+                    remove_retry(args.persist, tid)
+                except RateLimitError as e:
+                    back = compute_backoff(attempts, base=60, factor=3)
+                    update_retry(args.persist, tid, item['payload'], attempts, int(time.time()) + back)
+                    log.warning('[worker] rate limited selecting %s, scheduling next_try in %s', tid, back)
+                except Exception as e:
+                    back = compute_backoff(attempts, base=60, factor=3)
+                    update_retry(args.persist, tid, item['payload'], attempts, int(time.time()) + back)
+                    log.error('[worker] error selecting files for %s: %s, scheduling next_try %s', tid, e, back)
+
+                time.sleep(args.process_delay)
+            # worker runs forever
+            return 0
+
+        client.configure_select_rate(max_selects_per_minute)
+    except Exception:
+        pass
 
     try:
         # If collect-only mode requested: walk pages and dump IDs to file
@@ -953,7 +1021,9 @@ def main(argv=None):
 
         if args.daemon:
             # prepare config dict for run_cycle
-            cfg = {'video_exts': video_exts, 'include_subs': include_subs}
+            cfg = {'video_exts': video_exts, 'include_subs': include_subs,
+                   'max_selects_per_minute': max_selects_per_minute,
+                   'info_pause': info_pause, 'info_cache_ttl': info_cache_ttl}
             if args.persist:
                 init_db(args.persist)
             while True:
@@ -965,8 +1035,10 @@ def main(argv=None):
                     log.info('Daemon: nothing processed; sleeping 60s')
                     time.sleep(60)
                 else:
-                    log.info('Daemon: cycle complete; sleeping %s seconds', args.cycle_interval)
-                    time.sleep(args.cycle_interval)
+                    # if we processed items, sleep a shorter time to continue slowly (avoid 1h default bursts)
+                    short_sleep = min(300, args.cycle_interval)
+                    log.info('Daemon: cycle complete; processed %s items; sleeping %s seconds', processed, short_sleep)
+                    time.sleep(short_sleep)
         else:
             while True:
                 processed = run_once(client, video_exts, include_subs, pause, page_limit, max_pages,
