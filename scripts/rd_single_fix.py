@@ -33,9 +33,9 @@ import urllib.error
 import urllib.parse
 import socket
 from datetime import datetime
-import http.client
 import threading
 import random
+import requests
 
 DEFAULT_VIDEO_EXTS = ['.mkv', '.mp4', '.avi', '.mov', '.m4v']
 
@@ -64,10 +64,9 @@ class RealDebridClient:
         self.token = token
         self.base = 'https://api.real-debrid.com/rest/1.0'
         self.timeout = timeout
-        # http.client persistent connection pieces
-        self._host = 'api.real-debrid.com'
-        self._conn_lock = threading.Lock()
-        self._conn: Optional[http.client.HTTPSConnection] = None
+        # requests.Session for persistent connections
+        self._session = requests.Session()
+        self._session.headers.update({'Authorization': f'Bearer {self.token}', 'User-Agent': 'rd-single-fix/1.0'})
         # token-bucket for select_files smoothing (default 60/min)
         self._select_bucket: Optional['TokenBucket'] = None
 
@@ -217,15 +216,12 @@ class RealDebridClient:
 
         # Attempt to use persistent http.client connection for POST
         try:
-            status, resp_headers, text_bytes = self._http_post(path, body, headers)
-            text = text_bytes.decode('utf-8') if isinstance(text_bytes, (bytes, bytearray)) else str(text_bytes)
+            status, resp_headers, text = self._session_post(path, body, headers)
             if status >= 400:
-                # mimic previous behavior raising exceptions
                 if status == 429:
-                    # parse Retry-After if present
                     ra = None
-                    for k, v in resp_headers:
-                        if k.lower() == 'retry-after' and v.isdigit():
+                    for k, v in resp_headers.items():
+                        if k.lower() == 'retry-after' and str(v).isdigit():
                             ra = int(v)
                     raise RateLimitError('429', retry_after=ra)
                 if status == 509:
@@ -238,7 +234,6 @@ class RealDebridClient:
         except RateLimitError:
             raise
         except Exception:
-            # fallback to the generic _request implementation (urllib)
             data = {'files[]': ids}
             return self._request('POST', f'/torrents/selectFiles/{tid}', data=data)
 
@@ -306,35 +301,16 @@ class TokenBucket:
 
 
     def _http_post(self, path: str, body: bytes, headers: Dict[str, str]):
-        # internal method using http.client.HTTPSConnection on self._host
-        # returns (status, headers_list, body_bytes)
-        conn = None
-        with self._conn_lock:
-            if not self._conn:
-                self._conn = http.client.HTTPSConnection(self._host, timeout=self.timeout)
-            conn = self._conn
+        # implement using requests.Session
+        url = f'https://api.real-debrid.com{path}'
+        # merge headers with session headers
+        hdrs = dict(self._session.headers)
+        hdrs.update(headers or {})
         try:
-            conn.request('POST', path, body=body, headers=headers)
-            resp = conn.getresponse()
-            resp_body = resp.read()
-            resp_headers = list(resp.getheaders())
-            # if server closed, reset connection for next time
-            if getattr(resp, 'will_close', False):
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                with self._conn_lock:
-                    self._conn = None
-            return resp.status, resp_headers, resp_body
+            r = self._session.post(url, data=body, headers=hdrs, timeout=self.timeout)
+            return r.status_code, r.headers, r.text
         except Exception:
-            # if anything wrong, ensure connection reset
-            try:
-                conn.close()
-            except Exception:
-                pass
-            with self._conn_lock:
-                self._conn = None
+            # requests will internally manage connection pooling; just re-raise
             raise
 
 
