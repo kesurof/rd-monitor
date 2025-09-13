@@ -24,7 +24,24 @@ def extract_ids(info: Dict, video_exts: List[str], include_subs: bool) -> List[i
     return ids
 
 def fix_one(api, tid: str, video_exts: List[str], include_subs: bool) -> Dict:
+    # pre-check: try to find the torrent in recent pages to avoid unnecessary 404s
     try:
+        found = False
+        for p in range(1, 4):
+            try:
+                items = api.get_torrents(page=p, limit=100)
+            except Exception:
+                items = []
+            for t in items:
+                if t.get("id") == tid:
+                    found = True
+                    break
+            if found:
+                break
+        if not found:
+            log.info(f"Torrent {tid} non listé dans les pages récentes, skip")
+            return {"id": tid, "changed": False, "status": None, "reason": "not_listed"}
+
         info = api.get_torrent_info(tid)
     except Exception as e:
         log.warning(f"Impossible d'obtenir les infos du torrent {tid}: {e}")
