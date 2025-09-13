@@ -24,14 +24,30 @@ def extract_ids(info: Dict, video_exts: List[str], include_subs: bool) -> List[i
     return ids
 
 def fix_one(api, tid: str, video_exts: List[str], include_subs: bool) -> Dict:
-    info = api.get_torrent_info(tid)
+    try:
+        info = api.get_torrent_info(tid)
+    except Exception as e:
+        log.warning(f"Impossible d'obtenir les infos du torrent {tid}: {e}")
+        return {"id": tid, "changed": False, "status": None, "reason": "not_found_or_error", "error": str(e)}
+
     status = info.get("status")
     if status != "waiting_files_selection":
         return {"id": tid, "changed": False, "status": status, "reason": "not_waiting"}
+
     ids = extract_ids(info, video_exts, include_subs)
     if not ids:
         return {"id": tid, "changed": False, "status": status, "reason": "no_video_files"}
-    api.select_files(tid, ids)
+    try:
+        api.select_files(tid, ids)
+    except Exception as e:
+        log.exception(f"Erreur lors de la sélection des fichiers pour {tid}: {e}")
+        return {"id": tid, "changed": False, "status": status, "reason": "select_failed", "error": str(e)}
+
     time.sleep(1.0)
-    info2 = api.get_torrent_info(tid)
+    try:
+        info2 = api.get_torrent_info(tid)
+    except Exception as e:
+        log.warning(f"Impossible d'obtenir les infos (après sélection) du torrent {tid}: {e}")
+        return {"id": tid, "changed": True, "status": None, "selected_count": len(ids), "reason": "post_select_info_missing", "error": str(e)}
+
     return {"id": tid, "changed": True, "status": info2.get("status"), "selected_count": len(ids), "progress": info2.get("progress")}
