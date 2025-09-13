@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=%i
 WorkingDirectory=%h/Projets_Github/rd-monitor
-ExecStart=%h/Projets_Github/rd-monitor/.venv/bin/python3 %h/Projets_Github/rd-monitor/scripts/rd_single_fix.py --daemon --persist %h/Projets_Github/rd-monitor/data/auto_fix_state.db --results %h/Projets_Github/rd-monitor/data/auto_fix_results.jsonl --pause 1.5 --max-per-cycle 200 --cycle-interval 3600
+ExecStart=%h/Projets_Github/rd-monitor/scripts/run_service.sh --daemon --persist %h/Projets_Github/rd-monitor/data/auto_fix_state.db --results %h/Projets_Github/rd-monitor/data/auto_fix_results.jsonl --pause 1.5 --max-per-cycle 200 --cycle-interval 3600
 Restart=on-failure
 RestartSec=30
 Environment=PYTHONUNBUFFERED=1

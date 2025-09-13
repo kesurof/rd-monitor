@@ -20,6 +20,32 @@ Principes de sécurité
 - Ne stockez jamais votre token Real‑Debrid dans le dépôt. Utilisez soit la variable d'environnement
 	`REAL_DEBRID_TOKEN`, soit le fichier `.env` (ignoré par Git).
 
+Isolation de l'environnement Python (recommandé)
+
+Pour éviter d'interférer avec un venv existant dans le dépôt, le projet fournit un petit wrapper
+`scripts/run_service.sh` qui recherche un environnement isolé dans l'ordre suivant :
+
+1. la variable d'environnement `RD_VENV_PATH` (chemin vers l'exécutable Python dans un venv),
+2. `$HOME/.venvs/rd-monitor/bin/python` (emplacement recommandé pour un venv utilisateur),
+3. `./.venv/bin/python` (venv local au projet si présent),
+4. `python3` système.
+
+Créez un venv isolé recommandé :
+
+```bash
+python3 -m venv ~/.venvs/rd-monitor
+source ~/.venvs/rd-monitor/bin/activate
+pip install -r requirements.txt
+```
+
+Ensuite, soit exportez `RD_VENV_PATH` :
+
+```bash
+export RD_VENV_PATH="$HOME/.venvs/rd-monitor/bin/python"
+```
+
+soit laissez le wrapper le découvrir automatiquement.
+
 Installation rapide
 1. Clonez le dépôt et placez‑vous dedans :
 
@@ -28,11 +54,18 @@ git clone https://github.com/kesurof/rd-monitor.git
 cd rd-monitor
 ```
 
-2. Créez un environnement Python et installez les dépendances :
+
+2. Créez un environnement Python (ex. local ou recommandé ~/.venvs/rd-monitor) et installez les dépendances :
 
 ```bash
+# exemple : venv local
 python3 -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
+
+# ou venv utilisateur recommandé
+python3 -m venv ~/.venvs/rd-monitor
+source ~/.venvs/rd-monitor/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -58,6 +91,14 @@ Mode simulation (dry run) : n'exécute pas `selectFiles`, utile pour vérifier 
 
 Mode daemon (persistant, utilise SQLite pour retries) :
 
+Utilisez de préférence le wrapper `scripts/run_service.sh` pour démarrer le script avec l'environnement isolé découvert :
+
+```bash
+scripts/run_service.sh --daemon --persist data/auto_fix_state.db --results data/auto_fix_results.jsonl
+```
+
+ou si vous utilisez un venv local :
+
 ```bash
 .venv/bin/python scripts/rd_single_fix.py --daemon --persist data/auto_fix_state.db --results data/auto_fix_results.jsonl
 ```
@@ -71,8 +112,8 @@ Options importantes
 
 Systemd (exemple)
 
-L'unité fournie `service/rd-monitor-daemon.service` pointe par défaut vers l'environnement virtuel
-et le script. Pour l'installer pour votre utilisateur (<user>) :
+L'unité fournie `service/rd-monitor-daemon.service` utilise désormais le wrapper `scripts/run_service.sh`.
+Pour l'installer pour votre utilisateur (<user>) :
 
 ```bash
 sudo cp service/rd-monitor-daemon.service /etc/systemd/system/rd-monitor-daemon@<user>.service
