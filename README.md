@@ -33,14 +33,35 @@ Renseigner le token via le menu « Configurer le token » ou via `.env` (`REAL_D
 
 ## Service systemd (optionnel)
 
-suppose repo dans /home/$USER/scripts/rd-monitor
+Le projet fournit désormais un démon principal `scripts/run_daemon_fix.py` et une unité systemd
+prête à l'emploi `service/rd-monitor-daemon.service` (plus simple et plus robuste que les vieux
+fichiers dans `scripts/service/`).
 
-sudo cp scripts/service/rd-monitor.service /etc/systemd/system/rd-monitor.service
-sudo sed -i "s/%i/$USER/g" /etc/systemd/system/rd-monitor.service
+Exemple d'installation (remplacez <user> par votre nom d'utilisateur) :
+
+1. Créez et activez un environnement virtuel et installez les dépendances :
+
+```bash
+cd ~/Projets_Github/rd-monitor
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+2. Copier l'unité systemd et activer le service pour votre utilisateur :
+
+```bash
+sudo cp service/rd-monitor-daemon.service /etc/systemd/system/rd-monitor-daemon@<user>.service
 sudo systemctl daemon-reload
-sudo systemctl enable rd-monitor.service
-sudo systemctl start rd-monitor.service
-sudo systemctl status rd-monitor.service
+sudo systemctl enable --now rd-monitor-daemon@<user>.service
+```
+
+3. Vérifier le statut et suivre les logs :
+
+```bash
+systemctl status rd-monitor-daemon@<user>.service
+journalctl -u rd-monitor-daemon@<user>.service -f
+```
 
 
 ## Détection Docker (optionnelle)
@@ -54,3 +75,18 @@ Notes d’implémentation
 - Les endpoints Real‑Debrid utilisés et la nécessité d’appeler selectFiles pour démarrer le torrent sont documentés dans la doc officielle et un SDK tiers, ce que le script applique strictement [6][4].  
 - La détection des conteneurs et de leur IP s’appuie sur Docker SDK pour Python, pratique pour reproduire l’approche Arr‑Monitor qui inspecte des services liés [17][20].  
 - L’outil fonctionne sans dépendances « TUI » pour rester simple et portable dans SSH, mais peut être étendu avec curses/curses-menu si souhaité [7][10].
+
+## Changements récents
+
+- Suppressions : `scripts/run_mass_fix.py` et `scripts/find_waiting_by_info.py` ont été retirés — leurs
+	fonctionnalités sont maintenant couvertes par le démon `scripts/run_daemon_fix.py` et par
+	`scripts/inspect_waiting.py` pour les inspections manuelles.
+- Le fichier `scripts/service/rd-monitor.service` (dupliqué) a été supprimé. Conservez
+	`service/rd-monitor-daemon.service` qui est l'unité recommandée.
+
+Pourquoi : consolidation pour réduire la surface de maintenance et éviter les doublons. Le démon
+utilise une file d'attente SQLite (data/auto_fix_state.db) et journalise les résultats dans
+`data/auto_fix_results.jsonl`.
+
+Si vous souhaitez rétablir un script supprimé ou extraire une partie de son comportement,
+dites-le et je peux restaurer ou extraire le fragment concerné.

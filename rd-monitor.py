@@ -129,8 +129,11 @@ def monitor_loop(cfg):
                 for t in items:
                     tid = t.get("id")
                     status = t.get("status")
-                    if status == "waiting_files_selection":
-                        res = fix_one(api, tid, exts, include_subs)
+                    if status == "waiting_files_selection" or status == "magnet_conversion":
+                        # list status may be 'magnet_conversion' while detailed info is
+                        # 'waiting_files_selection'. Call fix_one with skip_precheck to
+                        # go straight to get_torrent_info and attempt selection.
+                        res = fix_one(api, tid, exts, include_subs, skip_precheck=True)
                         log.info(f"Fix {tid}: {res}")
                         processed += 1
                 if len(items) < 100:

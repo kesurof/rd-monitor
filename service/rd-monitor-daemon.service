@@ -1,0 +1,15 @@
+[Unit]
+Description=RD Monitor - daemon to auto-fix waiting torrents
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=%h/Projets_Github/rd-monitor
+ExecStart=%h/Projets_Github/rd-monitor/.venv/bin/python3 %h/Projets_Github/rd-monitor/scripts/run_daemon_fix.py --pause 1.5 --max-per-cycle 200 --cycle-interval 3600
+Restart=on-failure
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
