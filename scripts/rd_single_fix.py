@@ -32,6 +32,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import socket
+from datetime import datetime
 
 DEFAULT_VIDEO_EXTS = ['.mkv', '.mp4', '.avi', '.mov', '.m4v']
 
@@ -253,6 +254,59 @@ def init_db(db_path: str):
     con.commit()
     con.close()
 
+def list_queue(db_path: str, limit: int = 100) -> None:
+    """Print a human-friendly summary of the retries queue.
+
+    Shows id, attempts, next_try (ISO), and a short payload preview.
+    """
+    if not os.path.exists(db_path):
+        print(f"No DB at {db_path}")
+        return
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT id, attempts, next_try, payload FROM retries ORDER BY next_try ASC LIMIT ?", (limit,))
+    except sqlite3.OperationalError as e:
+        print(f"DB error: {e}")
+        conn.close()
+        return
+    rows = c.fetchall()
+    if not rows:
+        print("Queue is empty")
+        conn.close()
+        return
+    print(f"Showing up to {limit} items from {db_path}:")
+    now = datetime.utcnow()
+    for r in rows:
+        rid, attempts, next_try, payload = r
+        # payload may be JSON or text; make a short preview
+        preview = None
+        try:
+            preview = json.loads(payload)
+            preview_str = json.dumps(preview) if isinstance(preview, (dict, list)) else str(preview)
+        except Exception:
+            preview_str = str(payload)
+        if len(preview_str) > 80:
+            preview_str = preview_str[:77] + "..."
+        # next_try stored as timestamp float or ISO string depending on code; try to normalize
+        nt_display = str(next_try)
+        try:
+            if isinstance(next_try, (int, float)):
+                nt_display = datetime.utcfromtimestamp(float(next_try)).isoformat() + "Z"
+            else:
+                # try parse
+                nt_display = str(next_try)
+        except Exception:
+            nt_display = str(next_try)
+        # relative
+        try:
+            nt_dt = datetime.fromisoformat(nt_display.replace("Z", ""))
+            delta = nt_dt - now
+            rel = f"in {int(delta.total_seconds())}s" if delta.total_seconds() >= 0 else f"{int(-delta.total_seconds())}s ago"
+        except Exception:
+            rel = "?"
+        print(f"- id={rid} attempts={attempts} next_try={nt_display} ({rel}) payload={preview_str}")
+    conn.close()
 
 def add_retry(db_path: str, tid: str, payload: Dict, attempts: int = 0, next_try: int = 0):
     con = sqlite3.connect(db_path)
@@ -435,6 +489,10 @@ def run_cycle(client: RealDebridClient, cfg: Dict, pause: float, page_limit: int
     info_cache_ttl = cfg.get('info_cache_ttl', 300)
     info_cache: Dict[str, Dict] = {}
     info_cache_expiry: Dict[str, int] = {}
+    processed_ids = set()
+    selects_count = 0
+    selects_window_start = int(time.time())
+    selects_per_minute = cfg.get('max_selects_per_minute', 60)
 
     # 1) handle due retries
     if persist_db:
@@ -443,6 +501,9 @@ def run_cycle(client: RealDebridClient, cfg: Dict, pause: float, page_limit: int
             if max_per_cycle is not None and processed >= max_per_cycle:
                 break
             tid = item['id']
+            if tid in processed_ids:
+                log.debug('[retry] %s already processed this cycle, skipping', tid)
+                continue
             attempts = item['attempts'] + 1
             log.info('[retry] trying %s (attempt %s)', tid, attempts)
             now = int(time.time())
@@ -485,7 +546,20 @@ def run_cycle(client: RealDebridClient, cfg: Dict, pause: float, page_limit: int
                 continue
 
             try:
+                # global selects-per-minute throttle
+                now = int(time.time())
+                if selects_per_minute and selects_per_minute > 0:
+                    if now - selects_window_start >= 60:
+                        selects_window_start = now
+                        selects_count = 0
+                    if selects_count >= selects_per_minute:
+                        log.info('[retry] selects per minute limit reached, rescheduling %s', tid)
+                        back = compute_backoff(attempts)
+                        update_retry(persist_db, tid, item['payload'], attempts, int(time.time()) + back)
+                        continue
                 client.select_files(tid, ids)
+                selects_count += 1
+                processed_ids.add(tid)
                 log.info('[retry] selected files for %s', tid)
                 remove_retry(persist_db, tid)
             except RateLimitError as e:
@@ -531,6 +605,9 @@ def run_cycle(client: RealDebridClient, cfg: Dict, pause: float, page_limit: int
             if status not in ('waiting_files_selection', 'magnet_conversion'):
                 continue
             tid = str(t.get('id'))
+            if tid in processed_ids:
+                log.debug('[scan] %s already processed this cycle, skipping', tid)
+                continue
             fn = t.get('filename') or t.get('name') or ''
             log.info('[scan] processing %s %s', tid, fn)
             now = int(time.time())
@@ -568,7 +645,21 @@ def run_cycle(client: RealDebridClient, cfg: Dict, pause: float, page_limit: int
                 continue
 
             try:
+                now = int(time.time())
+                if selects_per_minute and selects_per_minute > 0:
+                    if now - selects_window_start >= 60:
+                        selects_window_start = now
+                        selects_count = 0
+                    if selects_count >= selects_per_minute:
+                        log.info('[scan] selects per minute limit reached, scheduling %s', tid)
+                        if persist_db:
+                            add_retry(persist_db, tid, {'summary': t}, attempts=1, next_try=int(time.time()) + compute_backoff(1))
+                        else:
+                            log.info('[scan] no persist DB; skipping %s this cycle', tid)
+                        continue
                 client.select_files(tid, ids)
+                selects_count += 1
+                processed_ids.add(tid)
                 log.info('[scan] selected files for %s', tid)
             except RateLimitError as e:
                 log.warning('[scan] rate limit %s selecting %s', e.code, tid)
@@ -614,6 +705,8 @@ def build_arg_parser():
     p.add_argument('--process-ids', help='Path to read candidate ids (one per line) and process them slowly')
     p.add_argument('--enqueue', action='store_true', help='When used with --process-ids, enqueue ids into --persist DB instead of immediate select')
     p.add_argument('--process-delay', type=int, default=60, help='Seconds spacing when enqueuing ids (used with --enqueue)')
+    p.add_argument('--max-selects-per-minute', type=int, default=60, help='Global cap of select_files calls per minute (0 = no cap)')
+    p.add_argument('--list-queue', action='store_true', help='List entries in the sqlite retry queue and exit')
     p.add_argument('--once', action='store_true', help='Run a single scan then exit')
     p.add_argument('--daemon', action='store_true', help='Run in daemon mode with persistence and backoff')
     p.add_argument('--cycle-interval', type=int, default=3600, help='Seconds between cycles when daemon')
@@ -624,6 +717,13 @@ def main(argv=None):
     argv = argv or sys.argv[1:]
     args = build_arg_parser().parse_args(argv)
     log = setup_logger()
+    # If user only wants to list the queue, allow running without token
+    if args.list_queue:
+        db_path = args.persist or 'data/auto_fix_state.db'
+        init_db(db_path)
+        list_queue(db_path)
+        return 0
+
     token = args.token or os.environ.get('REAL_DEBRID_TOKEN')
     if not token:
         log.error('No token provided. Use --token or set REAL_DEBRID_TOKEN')
