@@ -121,6 +121,57 @@ def compute_backoff(attempt: int, base: int = 60, factor: int = 2, max_backoff: 
     return min(back, max_backoff)
 
 
+# -----------------------
+# SQLite retry queue helpers
+# -----------------------
+def init_db(db_path: str):
+    ensure_dir(db_path)
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS retries (
+            id TEXT PRIMARY KEY,
+            payload TEXT,
+            attempts INTEGER DEFAULT 0,
+            next_try INTEGER DEFAULT 0
+        )
+    ''')
+    con.commit()
+    con.close()
+
+
+def add_retry(db_path: str, tid: str, payload: Dict, attempts: int = 0, next_try: int = 0):
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+    cur.execute('INSERT OR REPLACE INTO retries (id,payload,attempts,next_try) VALUES (?,?,?,?)',
+                (tid, json.dumps(payload, ensure_ascii=False), attempts, int(next_try)))
+    con.commit()
+    con.close()
+
+
+def pop_due(db_path: str, max_n: int = 50) -> List[Dict]:
+    now = int(time.time())
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+    cur.execute('SELECT id,payload,attempts,next_try FROM retries WHERE next_try<=? ORDER BY next_try ASC LIMIT ?', (now, max_n))
+    rows = cur.fetchall()
+    con.close()
+    return [{'id': r[0], 'payload': json.loads(r[1]), 'attempts': r[2], 'next_try': r[3]} for r in rows]
+
+
+def remove_retry(db_path: str, tid: str):
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+    cur.execute('DELETE FROM retries WHERE id=?', (tid,))
+    con.commit()
+    con.close()
+
+
+def update_retry(db_path: str, tid: str, payload: Dict, attempts: int, next_try: int):
+    add_retry(db_path, tid, payload, attempts, next_try)
+
+
+
 def run_once(client: RealDebridClient, video_exts: List[str], include_subs: bool, pause: float, page_limit: int,
              max_pages: Optional[int], results_path: Optional[str], dry_run: bool, log=None, persist_db: Optional[str]=None,
              max_per_cycle: Optional[int]=None):
@@ -234,6 +285,155 @@ def run_once(client: RealDebridClient, video_exts: List[str], include_subs: bool
     return processed
 
 
+def run_cycle(client: RealDebridClient, cfg: Dict, pause: float, page_limit: int, max_pages: Optional[int],
+              results_path: str, dry_run: bool, persist_db: Optional[str], max_per_cycle: Optional[int], log=None):
+    """Process retry queue first, then scan pages for new items and schedule retries with backoff."""
+    log = log or setup_logger()
+    processed = 0
+    video_exts = cfg.get('video_exts', DEFAULT_VIDEO_EXTS)
+    include_subs = cfg.get('include_subs', False)
+
+    # 1) handle due retries
+    if persist_db:
+        due = pop_due(persist_db, max_n=max_per_cycle or 50)
+        for item in due:
+            if max_per_cycle is not None and processed >= max_per_cycle:
+                break
+            tid = item['id']
+            attempts = item['attempts'] + 1
+            log.info('[retry] trying %s (attempt %s)', tid, attempts)
+            try:
+                info = client.get_torrent_info(tid)
+            except RateLimitError as e:
+                ra = e.retry_after or 60
+                log.warning('[retry] rate limited when getting info %s, sleeping %s', tid, ra)
+                time.sleep(ra)
+                # reschedule same attempt
+                back = compute_backoff(attempts)
+                update_retry(persist_db, tid, item['payload'], attempts, int(time.time()) + back)
+                continue
+            except Exception as e:
+                log.error('[retry] error getting info %s: %s', tid, e)
+                # schedule later
+                back = compute_backoff(attempts)
+                update_retry(persist_db, tid, item['payload'], attempts, int(time.time()) + back)
+                continue
+
+            ids = find_video_file_ids(info, video_exts, include_subs)
+            if not ids:
+                log.info('[retry] no video files for %s, removing retry', tid)
+                remove_retry(persist_db, tid)
+                processed += 1
+                continue
+
+            if dry_run:
+                log.info('[retry dry-run] would select %s for %s', ids, tid)
+                remove_retry(persist_db, tid)
+                processed += 1
+                continue
+
+            try:
+                client.select_files(tid, ids)
+                log.info('[retry] selected files for %s', tid)
+                remove_retry(persist_db, tid)
+            except RateLimitError as e:
+                attempts = item['attempts'] + 1
+                back = compute_backoff(attempts)
+                next_try = int(time.time()) + back
+                log.warning('[retry] rate limited selecting %s, scheduling next_try in %s', tid, back)
+                update_retry(persist_db, tid, item['payload'], attempts, next_try)
+            except Exception as e:
+                attempts = item['attempts'] + 1
+                back = compute_backoff(attempts)
+                next_try = int(time.time()) + back
+                log.error('[retry] error selecting files for %s: %s, scheduling next_try %s', tid, e, back)
+                update_retry(persist_db, tid, item['payload'], attempts, next_try)
+
+            processed += 1
+            time.sleep(pause)
+
+    # 2) scan pages for new items
+    page = 1
+    consecutive_509 = 0
+    while (max_per_cycle is None or processed < max_per_cycle):
+        if max_pages is not None and page > max_pages:
+            break
+        try:
+            items = client.get_torrents(page=page, limit=page_limit)
+        except RateLimitError as e:
+            ra = e.retry_after or 60
+            log.warning('Rate limited when listing torrents: sleeping %s', ra)
+            time.sleep(ra)
+            continue
+        except Exception as e:
+            log.error('Error listing torrents page %s: %s', page, e)
+            break
+
+        if not items:
+            break
+
+        for t in items:
+            if max_per_cycle is not None and processed >= max_per_cycle:
+                break
+            status = t.get('status')
+            if status not in ('waiting_files_selection', 'magnet_conversion'):
+                continue
+            tid = str(t.get('id'))
+            fn = t.get('filename') or t.get('name') or ''
+            log.info('[scan] processing %s %s', tid, fn)
+            try:
+                info = client.get_torrent_info(tid)
+            except RateLimitError as e:
+                ra = e.retry_after or 60
+                log.warning('[scan] rate limited when getting info %s: sleeping %s', tid, ra)
+                time.sleep(ra)
+                continue
+            except Exception as e:
+                log.error('[scan] error getting info %s: %s', tid, e)
+                continue
+
+            ids = find_video_file_ids(info, video_exts, include_subs)
+            if not ids:
+                # schedule retry in case metadata updates later
+                if persist_db:
+                    log.info('[scan] no video files for %s, scheduling retry', tid)
+                    add_retry(persist_db, tid, {'summary': t}, attempts=1, next_try=int(time.time()) + compute_backoff(1))
+                processed += 1
+                continue
+
+            if dry_run:
+                log.info('[scan dry-run] would select %s for %s', ids, tid)
+                processed += 1
+                continue
+
+            try:
+                client.select_files(tid, ids)
+                log.info('[scan] selected files for %s', tid)
+            except RateLimitError as e:
+                log.warning('[scan] rate limit %s selecting %s', e.code, tid)
+                # schedule retry
+                if persist_db:
+                    add_retry(persist_db, tid, {'summary': t}, attempts=1, next_try=int(time.time()) + compute_backoff(1))
+                # adaptive sleep on many 509s
+                if e.code == '509':
+                    consecutive_509 += 1
+                    sleep = min(60 * consecutive_509, 600)
+                    log.warning('[scan] sleeping %s due to consecutive 509s', sleep)
+                    time.sleep(sleep)
+            except Exception as e:
+                log.error('[scan] error selecting files for %s: %s', tid, e)
+                if persist_db:
+                    add_retry(persist_db, tid, {'summary': t}, attempts=1, next_try=int(time.time()) + compute_backoff(1))
+
+            processed += 1
+            time.sleep(pause)
+
+        page += 1
+
+    log.info('Run cycle complete processed %s items', processed)
+    return processed
+
+
 def build_arg_parser():
     p = argparse.ArgumentParser(description='Detect and relaunch RealDebrid torrents in waiting_files_selection')
     p.add_argument('--token', help='RealDebrid token (or set REAL_DEBRID_TOKEN)')
@@ -248,6 +448,8 @@ def build_arg_parser():
     p.add_argument('--dry-run', action='store_true', help='Do not call select_files, only simulate')
     p.add_argument('--persist', help='Enable sqlite persistence file (path). Optional')
     p.add_argument('--once', action='store_true', help='Run a single scan then exit')
+    p.add_argument('--daemon', action='store_true', help='Run in daemon mode with persistence and backoff')
+    p.add_argument('--cycle-interval', type=int, default=3600, help='Seconds between cycles when daemon')
     return p
 
 
@@ -269,19 +471,35 @@ def main(argv=None):
     client = RealDebridClient(token)
 
     try:
-        while True:
-            processed = run_once(client, video_exts, include_subs, pause, page_limit, max_pages,
-                                 args.results, args.dry_run, log=log, persist_db=args.persist,
-                                 max_per_cycle=max_per_cycle)
-            if args.once:
-                break
-            # if nothing processed, sleep longer
-            if processed == 0:
-                log.info('No items processed; sleeping 60s')
-                time.sleep(60)
-            else:
-                log.info('Cycle done; sleeping 300s before next cycle')
-                time.sleep(300)
+        if args.daemon:
+            # prepare config dict for run_cycle
+            cfg = {'video_exts': video_exts, 'include_subs': include_subs}
+            if args.persist:
+                init_db(args.persist)
+            while True:
+                processed = run_cycle(client, cfg, pause, page_limit, max_pages, args.results, args.dry_run,
+                                      args.persist, max_per_cycle, log=log)
+                if args.once:
+                    break
+                if processed == 0:
+                    log.info('Daemon: nothing processed; sleeping 60s')
+                    time.sleep(60)
+                else:
+                    log.info('Daemon: cycle complete; sleeping %s seconds', args.cycle_interval)
+                    time.sleep(args.cycle_interval)
+        else:
+            while True:
+                processed = run_once(client, video_exts, include_subs, pause, page_limit, max_pages,
+                                     args.results, args.dry_run, log=log, persist_db=args.persist,
+                                     max_per_cycle=max_per_cycle)
+                if args.once:
+                    break
+                if processed == 0:
+                    log.info('No items processed; sleeping 60s')
+                    time.sleep(60)
+                else:
+                    log.info('Cycle done; sleeping 300s before next cycle')
+                    time.sleep(300)
     except KeyboardInterrupt:
         log.info('Interrupted, exiting')
     return 0
