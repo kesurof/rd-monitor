@@ -38,6 +38,14 @@ DEFAULT_VIDEO_EXTS = ['.mkv', '.mp4', '.avi', '.mov', '.m4v']
 
 def setup_logger(level=logging.INFO):
     log = logging.getLogger('rd_single_fix')
+    # Respect environment override for log level
+    env_level = os.environ.get('RD_LOG_LEVEL') or os.environ.get('LOGLEVEL')
+    if env_level:
+        try:
+            level = getattr(logging, env_level.upper())
+        except Exception:
+            pass
+
     if not log.handlers:
         h = logging.StreamHandler()
         fmt = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
