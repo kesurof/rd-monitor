@@ -84,6 +84,19 @@ class RealDebridClient:
         while True:
             attempts += 1
             req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
+            # Debug: log body for selectFiles endpoint to inspect encoding (do not log token)
+            log = logging.getLogger('rd_single_fix')
+            try:
+                if '/torrents/selectFiles/' in path and body:
+                    try:
+                        body_preview = body.decode('utf-8')
+                    except Exception:
+                        body_preview = repr(body)
+                    safe_headers = {k: v for k, v in hdrs.items() if k.lower() != 'authorization'}
+                    log.debug('selectFiles POST body: %s', body_preview)
+                    log.debug('selectFiles headers: %s', safe_headers)
+            except Exception:
+                pass
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     status = resp.getcode()
