@@ -1,54 +1,78 @@
-# RD Monitor
+# RD Monitor — mode minimal
 
-Outil terminal pour Real-Debrid qui corrige automatiquement les torrents bloqués en `waiting_files_selection` en ne sélectionnant que les fichiers vidéo, avec monitoring continu, venv, logs, et intégration Docker optionnelle.
+Ce dépôt contient un unique outil autonome pour corriger les torrents Real‑Debrid bloqués en
+`waiting_files_selection` en sélectionnant automatiquement les fichiers vidéo.
 
-## Installation
+Composants présents
+- `scripts/rd_single_fix.py` : script autonome (mode interactif, one‑shot ou daemon) qui :
+	- scanne vos torrents Real‑Debrid,
+	- récupère les détails d'un torrent,
+	- sélectionne les fichiers vidéo (option pour inclure les sous‑titres),
+	- gère les erreurs de rate‑limit (429/Retry‑After et 509) et propose une file d'attente
+		persistante SQLite pour retenter automatiquement,
+	- journalise les actions dans un fichier JSONL.
+- `service/rd-monitor-daemon.service` : unité systemd d'exemple configurée pour lancer le script en mode
+	daemon (optionnelle).
+- `requirements.txt` : dépendances runtime minimales (requests).
+- `dev-requirements.txt` : dépendances de développement (pytest).
 
-git clone https://github.com/kesurof/rd-monitor.git
-cd rd-monitor
-chmod +x scripts/install-rd.sh
-./scripts/install-rd.sh
-source ~/.bashrc
-rd-monitor
+Principes de sécurité
+- Ne stockez jamais votre token Real‑Debrid dans le dépôt. Utilisez soit la variable d'environnement
+	`REAL_DEBRID_TOKEN`, soit le fichier `.env` (ignoré par Git).
 
-
-## Utilisation rapide
-
-- Menu: `rd-monitor`
-- Monitoring direct: `rd-monitor --monitor`
-- Lister: `rd-monitor --list`
-- Fix ID: `rd-monitor --fix <TORRENT_ID>`
-
-Renseigner le token via le menu « Configurer le token » ou via `.env` (`REAL_DEBRID_TOKEN=`).
-
-## Configuration
-
-- `.env`: REAL_DEBRID_TOKEN, VIDEO_EXTENSIONS, INCLUDE_SUBTITLES, CHECK_INTERVAL_SECONDS, LOG_LEVEL
-- `config/config.yaml.local`: surcouche persistante
-
-## Fonctionnement
-
-- RD API: `GET /torrents`, `GET /torrents/info/{id}`, `POST /torrents/selectFiles/{id}` pour lever l’état et démarrer [Doc RD].
-- Filtrage: `.mkv,.mp4,.avi,.mov,.m4v` par défaut; option d’inclure `.srt/.ass`.
-
-## Service systemd (optionnel)
-
-Le projet fournit désormais un démon principal `scripts/run_daemon_fix.py` et une unité systemd
-prête à l'emploi `service/rd-monitor-daemon.service` (plus simple et plus robuste que les vieux
-fichiers dans `scripts/service/`).
-
-Exemple d'installation (remplacez <user> par votre nom d'utilisateur) :
-
-1. Créez et activez un environnement virtuel et installez les dépendances :
+Installation rapide
+1. Clonez le dépôt et placez‑vous dedans :
 
 ```bash
-cd ~/Projets_Github/rd-monitor
+git clone https://github.com/kesurof/rd-monitor.git
+cd rd-monitor
+```
+
+2. Créez un environnement Python et installez les dépendances :
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-2. Copier l'unité systemd et activer le service pour votre utilisateur :
+3. Exportez votre token (ou placez‑le dans `.env`) :
+
+```bash
+export REAL_DEBRID_TOKEN="<votre_token>"
+```
+
+Utilisation du script
+
+Mode one‑shot (analyse et tentative de correction une seule fois) :
+
+```bash
+.venv/bin/python scripts/rd_single_fix.py --once
+```
+
+Mode simulation (dry run) : n'exécute pas `selectFiles`, utile pour vérifier quels torrents seraient visés :
+
+```bash
+.venv/bin/python scripts/rd_single_fix.py --once --dry-run
+```
+
+Mode daemon (persistant, utilise SQLite pour retries) :
+
+```bash
+.venv/bin/python scripts/rd_single_fix.py --daemon --persist data/auto_fix_state.db --results data/auto_fix_results.jsonl
+```
+
+Options importantes
+- `--video-exts` : liste séparée par des virgules d'extensions vidéo à sélectionner (par défaut `.mkv,.mp4,.avi,.mov,.m4v`).
+- `--include-subs` : inclure également les fichiers de sous‑titres (.srt, .ass).
+- `--pause` : pause en secondes entre sélections pour limiter le rythme des appels API.
+- `--max-per-cycle` : nombre maximal d'éléments traités par cycle.
+- `--cycle-interval` : intervalle (en s) entre deux cycles en mode daemon.
+
+Systemd (exemple)
+
+L'unité fournie `service/rd-monitor-daemon.service` pointe par défaut vers l'environnement virtuel
+et le script. Pour l'installer pour votre utilisateur (<user>) :
 
 ```bash
 sudo cp service/rd-monitor-daemon.service /etc/systemd/system/rd-monitor-daemon@<user>.service
@@ -56,37 +80,23 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now rd-monitor-daemon@<user>.service
 ```
 
-3. Vérifier le statut et suivre les logs :
+Vérifier le service et les logs :
 
 ```bash
 systemctl status rd-monitor-daemon@<user>.service
 journalctl -u rd-monitor-daemon@<user>.service -f
 ```
 
+Fichiers de sortie
+- `data/auto_fix_results.jsonl` : journal JSONL des actions (succès/échecs) — localement produit par le script.
+- `data/auto_fix_state.db` : base SQLite utilisée en mode `--persist` pour mémoriser la file d'attente des retries.
 
-## Détection Docker (optionnelle)
+Support & personnalisation
+- Le script est conçu pour être simple et modulaire : vous pouvez modifier `--pause`, `--max-per-cycle` et
+	les règles d'extensions pour l'adapter à votre usage.
+- Si vous souhaitez que je prépare une installation systemd automatisée sur cette machine ou que je pousse
+	ces changements sur le dépôt distant, dites‑le et je m'en occupe.
 
-Affiche état/IP des conteneurs dont le nom contient `rdt-client` ou `debrid-media-manager`.
-
-
-[6][4][17][20]
-
-Notes d’implémentation
-- Les endpoints Real‑Debrid utilisés et la nécessité d’appeler selectFiles pour démarrer le torrent sont documentés dans la doc officielle et un SDK tiers, ce que le script applique strictement [6][4].  
-- La détection des conteneurs et de leur IP s’appuie sur Docker SDK pour Python, pratique pour reproduire l’approche Arr‑Monitor qui inspecte des services liés [17][20].  
-- L’outil fonctionne sans dépendances « TUI » pour rester simple et portable dans SSH, mais peut être étendu avec curses/curses-menu si souhaité [7][10].
-
-## Changements récents
-
-- Suppressions : `scripts/run_mass_fix.py` et `scripts/find_waiting_by_info.py` ont été retirés — leurs
-	fonctionnalités sont maintenant couvertes par le démon `scripts/run_daemon_fix.py` et par
-	`scripts/inspect_waiting.py` pour les inspections manuelles.
-- Le fichier `scripts/service/rd-monitor.service` (dupliqué) a été supprimé. Conservez
-	`service/rd-monitor-daemon.service` qui est l'unité recommandée.
-
-Pourquoi : consolidation pour réduire la surface de maintenance et éviter les doublons. Le démon
-utilise une file d'attente SQLite (data/auto_fix_state.db) et journalise les résultats dans
-`data/auto_fix_results.jsonl`.
-
-Si vous souhaitez rétablir un script supprimé ou extraire une partie de son comportement,
-dites-le et je peux restaurer ou extraire le fragment concerné.
+---
+Pour toute question ou adaptation (par exemple exporter des métriques, ajouter un résumé quotidien,
+ou intégrer un webhook), dites ce que vous voulez et je l'implémenterai.
