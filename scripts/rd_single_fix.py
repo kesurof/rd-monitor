@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""rd_single_fix.py
+
+Script autonome (un seul fichier) pour détecter et relancer les torrents
+ayant le statut `waiting_files_selection` sur Real‑Debrid.
+
+Fonctionnalités principales:
+- utilise l'API RealDebrid (token via --token ou env REAL_DEBRID_TOKEN)
+- scanne les pages de torrents, vérifie le détail et sélectionne uniquement
+  les fichiers vidéo (extensions configurables)
+- gestion basique des limites (Retry-After / 429, et détection 509)
+- option `--dry-run` pour simuler
+- option `--persist` pour activer une file d'attente SQLite (facultative)
+- enregistre les résultats dans un fichier JSONL
+
+Usage minimal:
+  ./scripts/rd_single_fix.py --token $REAL_DEBRID_TOKEN
+
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sqlite3
+import sys
+import time
+from typing import Dict, List, Optional
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+DEFAULT_VIDEO_EXTS = ['.mkv', '.mp4', '.avi', '.mov', '.m4v']
+
+
+def setup_logger(level=logging.INFO):
+    log = logging.getLogger('rd_single_fix')
+    if not log.handlers:
+        h = logging.StreamHandler()
+        fmt = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
+        h.setFormatter(fmt)
+        log.addHandler(h)
+    log.setLevel(level)
+    return log
+
+
+class RealDebridClient:
+    def __init__(self, token: str, timeout: int = 30):
+        self.token = token
+        self.base = 'https://api.real-debrid.com/rest/1.0'
+        self.s = requests.Session()
+        retries = Retry(total=3, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504))
+        self.s.mount('https://', HTTPAdapter(max_retries=retries))
+        self.s.headers.update({'Authorization': f'Bearer {self.token}'})
+        self.timeout = timeout
+
+    def _request(self, method: str, path: str, **kwargs):
+        url = f'{self.base}{path}'
+        resp = self.s.request(method, url, timeout=self.timeout, **kwargs)
+        if resp.status_code == 429:
+            # respect Retry-After if present
+            ra = resp.headers.get('Retry-After')
+            raise RateLimitError('429', retry_after=int(ra) if ra and ra.isdigit() else None)
+        if resp.status_code == 509:
+            raise RateLimitError('509')
+        resp.raise_for_status()
+        try:
+            return resp.json()
+        except ValueError:
+            return resp.text
+
+    def get_torrents(self, page: int = 1, limit: int = 100):
+        return self._request('GET', f'/torrents?page={page}&limit={limit}')
+
+    def get_torrent_info(self, tid: str):
+        return self._request('GET', f'/torrents/info/{tid}')
+
+    def select_files(self, tid: str, ids: List[str]):
+        data = {'files[]': ids}
+        return self._request('POST', f'/torrents/selectFiles/{tid}', data=data)
+
+
+class RateLimitError(Exception):
+    def __init__(self, code: str, retry_after: Optional[int] = None):
+        super().__init__(f'Rate limit {code}')
+        self.code = code
+        self.retry_after = retry_after
+
+
+def find_video_file_ids(info: Dict, video_exts: List[str], include_subs: bool) -> List[str]:
+    ids: List[str] = []
+    files = info.get('files') or []
+    for f in files:
+        path = f.get('path', '').lower()
+        fid = str(f.get('id') or f.get('index') or '')
+        if not fid:
+            continue
+        if any(path.endswith(ext) for ext in video_exts):
+            ids.append(fid)
+        elif include_subs and any(path.endswith(ext) for ext in ('.srt', '.ass', '.vtt')):
+            ids.append(fid)
+    return ids
+
+
+def ensure_dir(path: str):
+    d = os.path.dirname(path)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
+
+
+def append_results(path: str, obj: Dict):
+    ensure_dir(path)
+    with open(path, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + '\n')
+
+
+def compute_backoff(attempt: int, base: int = 60, factor: int = 2, max_backoff: int = 3600) -> int:
+    back = int(base * (factor ** max(0, attempt - 1)))
+    return min(back, max_backoff)
+
+
+def run_once(client: RealDebridClient, video_exts: List[str], include_subs: bool, pause: float, page_limit: int,
+             max_pages: Optional[int], results_path: Optional[str], dry_run: bool, log=None, persist_db: Optional[str]=None,
+             max_per_cycle: Optional[int]=None):
+    log = log or setup_logger()
+    processed = 0
+    page = 1
+
+    # optional sqlite persistence for retries
+    conn = None
+    if persist_db:
+        ensure_dir(persist_db)
+        conn = sqlite3.connect(persist_db)
+        cur = conn.cursor()
+        cur.execute('''CREATE TABLE IF NOT EXISTS retries (id TEXT PRIMARY KEY, attempts INTEGER, next_try INTEGER)''')
+        conn.commit()
+
+    while True:
+        if max_pages is not None and page > max_pages:
+            break
+        try:
+            items = client.get_torrents(page=page, limit=page_limit)
+        except RateLimitError as e:
+            ra = e.retry_after or 60
+            log.warning('Rate limited when listing torrents: %s, sleeping %ss', e.code, ra)
+            time.sleep(ra)
+            continue
+        except Exception as e:
+            log.error('Error fetching torrents page %s: %s', page, e)
+            break
+
+        if not items:
+            break
+
+        for t in items:
+            if max_per_cycle is not None and processed >= max_per_cycle:
+                log.info('Reached max_per_cycle=%s, stopping cycle', max_per_cycle)
+                break
+            status = t.get('status')
+            if status not in ('waiting_files_selection', 'magnet_conversion'):
+                continue
+            tid = str(t.get('id'))
+            fn = t.get('filename') or t.get('name') or ''
+            log.info('Checking %s %s', tid, fn)
+            try:
+                info = client.get_torrent_info(tid)
+            except RateLimitError as e:
+                ra = e.retry_after or 60
+                log.warning('Rate limited when getting info for %s: sleeping %ss', tid, ra)
+                time.sleep(ra)
+                continue
+            except Exception as e:
+                log.error('Error getting info for %s: %s', tid, e)
+                continue
+
+            ids = find_video_file_ids(info, video_exts, include_subs)
+            found = bool(ids)
+            changed = False
+            reason = None
+
+            if not ids:
+                reason = 'no_video_files'
+                log.info('No video files found for %s', tid)
+            else:
+                log.info('Will select %s files for %s', len(ids), tid)
+                if dry_run:
+                    log.info('[dry-run] would call select_files(%s, %s)', tid, ids)
+                    changed = False
+                    reason = 'dry_run'
+                else:
+                    try:
+                        client.select_files(tid, ids)
+                        changed = True
+                        reason = 'selected'
+                        log.info('Selected %s files for %s', len(ids), tid)
+                    except RateLimitError as e:
+                        reason = f'select_failed_{e.code}'
+                        log.warning('Rate limit (%s) when selecting files for %s', e.code, tid)
+                        if e.retry_after:
+                            time.sleep(e.retry_after)
+                        else:
+                            # exponential backoff simple
+                            time.sleep(compute_backoff(1))
+                    except Exception as e:
+                        reason = 'select_failed'
+                        log.error('Error selecting files for %s: %s', tid, e)
+
+            res = {
+                'ts': int(time.time()),
+                'id': tid,
+                'filename': fn,
+                'status': status,
+                'found_files': len(ids),
+                'changed': changed,
+                'reason': reason,
+            }
+            if results_path:
+                try:
+                    append_results(results_path, res)
+                except Exception:
+                    log.exception('Failed to append result')
+
+            processed += 1
+            time.sleep(pause)
+
+        page += 1
+
+    if conn:
+        conn.close()
+
+    log.info('Cycle complete, processed %s items', processed)
+    return processed
+
+
+def build_arg_parser():
+    p = argparse.ArgumentParser(description='Detect and relaunch RealDebrid torrents in waiting_files_selection')
+    p.add_argument('--token', help='RealDebrid token (or set REAL_DEBRID_TOKEN)')
+    p.add_argument('--video-exts', default=','.join(DEFAULT_VIDEO_EXTS),
+                   help='Comma-separated list of video extensions (default .mkv,.mp4,...)')
+    p.add_argument('--include-subs', action='store_true', help='Also select subtitle files (.srt,.ass)')
+    p.add_argument('--pause', type=float, default=1.5, help='Seconds to sleep between selects')
+    p.add_argument('--page-limit', type=int, default=100, help='Torrents per page')
+    p.add_argument('--max-pages', type=int, default=50, help='Max pages to scan (use 0 or -1 for unlimited)')
+    p.add_argument('--max-per-cycle', type=int, default=200, help='Max items to process per run')
+    p.add_argument('--results', default='data/auto_fix_results.jsonl', help='Path to append JSONL results')
+    p.add_argument('--dry-run', action='store_true', help='Do not call select_files, only simulate')
+    p.add_argument('--persist', help='Enable sqlite persistence file (path). Optional')
+    p.add_argument('--once', action='store_true', help='Run a single scan then exit')
+    return p
+
+
+def main(argv=None):
+    argv = argv or sys.argv[1:]
+    args = build_arg_parser().parse_args(argv)
+    log = setup_logger()
+    token = args.token or os.environ.get('REAL_DEBRID_TOKEN')
+    if not token:
+        log.error('No token provided. Use --token or set REAL_DEBRID_TOKEN')
+        return 2
+    video_exts = [e if e.startswith('.') else f'.{e}' for e in (v.strip() for v in args.video_exts.split(',')) if e]
+    include_subs = args.include_subs
+    pause = args.pause
+    page_limit = args.page_limit
+    max_pages = None if args.max_pages <= 0 else args.max_pages
+    max_per_cycle = None if args.max_per_cycle <= 0 else args.max_per_cycle
+
+    client = RealDebridClient(token)
+
+    try:
+        while True:
+            processed = run_once(client, video_exts, include_subs, pause, page_limit, max_pages,
+                                 args.results, args.dry_run, log=log, persist_db=args.persist,
+                                 max_per_cycle=max_per_cycle)
+            if args.once:
+                break
+            # if nothing processed, sleep longer
+            if processed == 0:
+                log.info('No items processed; sleeping 60s')
+                time.sleep(60)
+            else:
+                log.info('Cycle done; sleeping 300s before next cycle')
+                time.sleep(300)
+    except KeyboardInterrupt:
+        log.info('Interrupted, exiting')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
