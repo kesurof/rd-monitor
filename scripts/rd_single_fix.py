@@ -687,6 +687,8 @@ def main(argv=None):
                 if not args.persist:
                     log.error('--enqueue requires --persist <db_path> to be set')
                     return 2
+                # ensure DB/table exists
+                init_db(args.persist)
                 # enqueue ids spaced by process_delay
                 now = int(time.time())
                 for i, tid in enumerate(ids):
