@@ -12,6 +12,36 @@ from rd_lib.logger import setup_logger
 from rd_lib.rd_api import RealDebridAPI
 from rd_lib.rd_logic import fix_one
 from rd_lib.docker_utils import list_containers
+import aiohttp
+from rd_lib.rd_async import fetch_all_torrents
+import json
+import asyncio
+from pathlib import Path
+
+
+# simple upsert helpers: write JSONL to data/ for persistence
+DATA_DIR = Path(__file__).resolve().parents[0] / "data"
+DATA_DIR.mkdir(exist_ok=True)
+
+
+def upsert_torrent_sync(t: dict):
+    """Append a torrent JSON to data/torrents.jsonl (simple upsert simulation).
+    If same id exists, this naively appends — keep it simple for now.
+    """
+    p = DATA_DIR / "torrents.jsonl"
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(json.dumps(t, ensure_ascii=False) + "\n")
+
+
+async def _run_fetch_all(token: str, max_pages: int = None):
+    async with asyncio.Semaphore(1):
+        async with aiohttp.ClientSession() as session:
+            total = await fetch_all_torrents(token, upsert_torrent_sync, session=session, max_pages=max_pages)
+            return total
+
+
+def fetch_all_sync(token: str, max_pages: int = None):
+    return asyncio.run(_run_fetch_all(token, max_pages=max_pages))
 
 BANNER = "RD Monitor - Sélection auto vidéos (Real-Debrid)"
 
@@ -23,6 +53,7 @@ def print_menu():
     print("4) Configurer le token/API et extensions")
     print("5) Infos Docker (optionnel)")
     print("6) Voir le log en temps réel")
+    print("8) Exporter tous les torrents (async, JSONL)")
     print("7) Quitter")
 
 def tail_log(log_file):
@@ -152,6 +183,11 @@ def main():
                 tail_log(log_file)
             except KeyboardInterrupt:
                 pass
+        elif choice == "8":
+            # Export all torrents async -> JSONL via upsert_torrent_sync
+            print("Export des torrents (cela peut prendre du temps)...")
+            total = fetch_all_sync(cfg["real_debrid"]["token"], max_pages=None)
+            print(f"Export terminé. {total} torrents traités.")
         elif choice == "7":
             print("Au revoir.")
             break
