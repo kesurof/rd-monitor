@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "== RD Monitor Installer =="
 
@@ -22,15 +22,16 @@ mkdir -p "$ROOT/config" "$ROOT/logs"
 
 # Commandes shell (bashrc helper)
 if ! grep -q "# RD Monitor function" "$HOME/.bashrc" 2>/dev/null; then
-cat >> "$HOME/.bashrc" <<'EOF'
+cat >> "$HOME/.bashrc" <<EOF
 # RD Monitor function
 rd-monitor() {
-  local ROOT_DIR="$HOME/scripts/rd-monitor"
-  if [ -d "$ROOT_DIR/venv" ]; then
-    source "$ROOT_DIR/venv/bin/activate"
-    python "$ROOT_DIR/rd-monitor.py" "$@"
+  local ROOT_DIR="$ROOT"
+  if [ -d "\$ROOT_DIR/venv" ]; then
+    # shellcheck disable=SC1091
+    source "\$ROOT_DIR/venv/bin/activate"
+    python "\$ROOT_DIR/rd-monitor.py" "\$@"
   else
-    echo "rd-monitor non initialisé (venv manquant)"
+    echo "rd-monitor non initialisé (venv manquant dans \$ROOT_DIR)"
   fi
 }
 EOF
