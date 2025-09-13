@@ -4,7 +4,7 @@ Outil terminal pour Real-Debrid qui corrige automatiquement les torrents bloqué
 
 ## Installation
 
-git clone https://github.com/youruser/rd-monitor.git
+git clone https://github.com/kesurof/rd-monitor.git
 cd rd-monitor
 chmod +x scripts/install-rd.sh
 ./scripts/install-rd.sh
