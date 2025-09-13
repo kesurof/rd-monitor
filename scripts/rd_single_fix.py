@@ -610,6 +610,8 @@ def build_arg_parser():
     p.add_argument('--persist', help='Enable sqlite persistence file (path). Optional')
     p.add_argument('--info-pause', type=float, default=0.5, help='Seconds to sleep after fetching torrent info')
     p.add_argument('--info-cache-ttl', type=int, default=300, help='Seconds to cache torrent info in memory')
+    p.add_argument('--collect-ids', help='Path to write candidate ids (one per line). Only collect, do not select')
+    p.add_argument('--process-ids', help='Path to read candidate ids (one per line) and process them slowly')
     p.add_argument('--once', action='store_true', help='Run a single scan then exit')
     p.add_argument('--daemon', action='store_true', help='Run in daemon mode with persistence and backoff')
     p.add_argument('--cycle-interval', type=int, default=3600, help='Seconds between cycles when daemon')
@@ -634,6 +636,86 @@ def main(argv=None):
     client = RealDebridClient(token)
 
     try:
+        # If collect-only mode requested: walk pages and dump IDs to file
+        if args.collect_ids:
+            path = args.collect_ids
+            log.info('Collecting candidate ids to %s', path)
+            # iterate pages until empty or until max_pages if set
+            page = 1
+            written = 0
+            with open(path, 'w', encoding='utf-8') as fh:
+                while True:
+                    if max_pages is not None and page > max_pages:
+                        break
+                    try:
+                        items = client.get_torrents(page=page, limit=page_limit)
+                    except RateLimitError as e:
+                        ra = e.retry_after or 60
+                        log.warning('Rate limited when listing torrents: sleeping %ss', ra)
+                        time.sleep(ra)
+                        continue
+                    except Exception as e:
+                        log.error('Error listing torrents page %s: %s', page, e)
+                        break
+
+                    if not items:
+                        break
+
+                    for t in items:
+                        status = t.get('status')
+                        if status in ('waiting_files_selection', 'magnet_conversion'):
+                            tid = str(t.get('id'))
+                            fh.write(tid + '\n')
+                            written += 1
+                    page += 1
+
+            log.info('Collected %s candidate ids to %s', written, path)
+            return 0
+
+        # If processing from file requested: read IDs and process each slowly
+        if args.process_ids:
+            path = args.process_ids
+            if not os.path.exists(path):
+                log.error('Process ids file not found: %s', path)
+                return 2
+            with open(path, 'r', encoding='utf-8') as fh:
+                ids = [line.strip() for line in fh if line.strip()]
+            log.info('Processing %s ids from %s', len(ids), path)
+            for tid in ids:
+                try:
+                    info = client.get_torrent_info(tid)
+                except RateLimitError as e:
+                    ra = e.retry_after or 60
+                    log.warning('Rate limited when getting info for %s: sleeping %ss', tid, ra)
+                    time.sleep(ra)
+                    continue
+                except Exception as e:
+                    log.error('Error getting info for %s: %s', tid, e)
+                    continue
+
+                ids_to_select = find_video_file_ids(info, video_exts, include_subs)
+                if not ids_to_select:
+                    log.info('No video files for %s, skipping', tid)
+                    continue
+                if args.dry_run:
+                    log.info('[dry-run] would select %s for %s', ids_to_select, tid)
+                    continue
+                try:
+                    client.select_files(tid, ids_to_select)
+                    log.info('Selected %s files for %s', len(ids_to_select), tid)
+                except RateLimitError as e:
+                    log.warning('Rate limit %s selecting %s', e.code, tid)
+                    if e.retry_after:
+                        time.sleep(e.retry_after)
+                    else:
+                        time.sleep(compute_backoff(1))
+                except Exception as e:
+                    log.error('Error selecting files for %s: %s', tid, e)
+
+                # small pause between items to be gentle
+                time.sleep(pause)
+            return 0
+
         if args.daemon:
             # prepare config dict for run_cycle
             cfg = {'video_exts': video_exts, 'include_subs': include_subs}
