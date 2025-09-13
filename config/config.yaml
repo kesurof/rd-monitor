@@ -1,0 +1,12 @@
+monitoring:
+  check_interval: 90
+real_debrid:
+  token: ""
+  video_extensions: [".mkv", ".mp4", ".avi", ".mov", ".m4v"]
+  include_subtitles: false
+docker:
+  enabled: true
+  watch_names: ["rdt-client", "debrid-media-manager"]
+logging:
+  level: "INFO"
+  file: "logs/rd-monitor.log"

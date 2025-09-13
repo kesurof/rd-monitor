@@ -1,0 +1,15 @@
+[Unit]
+Description=RD Monitor - Real Debrid waiting_files_selection fixer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/scripts/rd-monitor
+ExecStart=/home/%i/scripts/rd-monitor/venv/bin/python /home/%i/scripts/rd-monitor/rd-monitor.py --monitor
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
