@@ -33,6 +33,9 @@ import urllib.error
 import urllib.parse
 import socket
 from datetime import datetime
+import http.client
+import threading
+import random
 
 DEFAULT_VIDEO_EXTS = ['.mkv', '.mp4', '.avi', '.mov', '.m4v']
 
@@ -61,6 +64,12 @@ class RealDebridClient:
         self.token = token
         self.base = 'https://api.real-debrid.com/rest/1.0'
         self.timeout = timeout
+        # http.client persistent connection pieces
+        self._host = 'api.real-debrid.com'
+        self._conn_lock = threading.Lock()
+        self._conn: Optional[http.client.HTTPSConnection] = None
+        # token-bucket for select_files smoothing (default 60/min)
+        self._select_bucket: Optional['TokenBucket'] = None
 
     def _request(self, method: str, path: str, data: Optional[dict] = None, headers: Optional[dict] = None):
         url = f'{self.base}{path}'
@@ -193,8 +202,52 @@ class RealDebridClient:
         return self._request('GET', f'/torrents/info/{tid}')
 
     def select_files(self, tid: str, ids: List[str]):
-        data = {'files[]': ids}
-        return self._request('POST', f'/torrents/selectFiles/{tid}', data=data)
+        # Use token-bucket to smooth selects if configured
+        if self._select_bucket:
+            # block until allowed
+            self._select_bucket.wait_for(1)
+
+        # Prefer CSV form-urlencoded as working encoding
+        files_csv = ','.join(str(x) for x in ids)
+        path = f'/rest/1.0/torrents/selectFiles/{tid}'
+        body = f'files={urllib.parse.quote_plus(files_csv)}'.encode('utf-8')
+        headers = {'Authorization': f'Bearer {self.token}', 'User-Agent': 'rd-single-fix/1.0',
+                   'Content-Type': 'application/x-www-form-urlencoded', 'Connection': 'keep-alive',
+                   'Content-Length': str(len(body))}
+
+        # Attempt to use persistent http.client connection for POST
+        try:
+            status, resp_headers, text_bytes = self._http_post(path, body, headers)
+            text = text_bytes.decode('utf-8') if isinstance(text_bytes, (bytes, bytearray)) else str(text_bytes)
+            if status >= 400:
+                # mimic previous behavior raising exceptions
+                if status == 429:
+                    # parse Retry-After if present
+                    ra = None
+                    for k, v in resp_headers:
+                        if k.lower() == 'retry-after' and v.isdigit():
+                            ra = int(v)
+                    raise RateLimitError('429', retry_after=ra)
+                if status == 509:
+                    raise RateLimitError('509')
+                raise Exception(f'HTTP {status} returned: {text}')
+            try:
+                return json.loads(text)
+            except Exception:
+                return text
+        except RateLimitError:
+            raise
+        except Exception:
+            # fallback to the generic _request implementation (urllib)
+            data = {'files[]': ids}
+            return self._request('POST', f'/torrents/selectFiles/{tid}', data=data)
+
+    def configure_select_rate(self, max_per_minute: int):
+        if max_per_minute and max_per_minute > 0:
+            # bucket capacity = burst of 5 or max_per_minute whichever is smaller
+            capacity = max(5, min(max_per_minute, 60))
+            refill_per_sec = float(max_per_minute) / 60.0
+            self._select_bucket = TokenBucket(capacity=capacity, refill_rate_per_sec=refill_per_sec)
 
 
 class RateLimitError(Exception):
@@ -217,6 +270,72 @@ def find_video_file_ids(info: Dict, video_exts: List[str], include_subs: bool) -
         elif include_subs and any(path.endswith(ext) for ext in ('.srt', '.ass', '.vtt')):
             ids.append(fid)
     return ids
+
+
+class TokenBucket:
+    """Simple token-bucket rate limiter."""
+    def __init__(self, capacity: int, refill_rate_per_sec: float):
+        self.capacity = float(capacity)
+        self.tokens = float(capacity)
+        self.refill_rate = float(refill_rate_per_sec)
+        self._last = time.time()
+        self._lock = threading.Lock()
+
+    def _refill(self):
+        now = time.time()
+        with self._lock:
+            delta = now - self._last
+            if delta > 0:
+                self.tokens = min(self.capacity, self.tokens + delta * self.refill_rate)
+                self._last = now
+
+    def consume(self, n: float = 1.0) -> bool:
+        self._refill()
+        with self._lock:
+            if self.tokens >= n:
+                self.tokens -= n
+                return True
+            return False
+
+    def wait_for(self, n: float = 1.0):
+        # busy-wait with sleep small intervals
+        while True:
+            if self.consume(n):
+                return
+            time.sleep(0.1 + random.random() * 0.1)
+
+
+    def _http_post(self, path: str, body: bytes, headers: Dict[str, str]):
+        # internal method using http.client.HTTPSConnection on self._host
+        # returns (status, headers_list, body_bytes)
+        conn = None
+        with self._conn_lock:
+            if not self._conn:
+                self._conn = http.client.HTTPSConnection(self._host, timeout=self.timeout)
+            conn = self._conn
+        try:
+            conn.request('POST', path, body=body, headers=headers)
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            resp_headers = list(resp.getheaders())
+            # if server closed, reset connection for next time
+            if getattr(resp, 'will_close', False):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                with self._conn_lock:
+                    self._conn = None
+            return resp.status, resp_headers, resp_body
+        except Exception:
+            # if anything wrong, ensure connection reset
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._conn_lock:
+                self._conn = None
+            raise
 
 
 def ensure_dir(path: str):
