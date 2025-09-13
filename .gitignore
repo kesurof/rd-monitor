@@ -54,3 +54,14 @@ logs/
 
 # Local config overrides
 config/config.yaml.local
+
+# Data artifacts (do not commit runtime state)
+/data/*.db
+/data/*.sqlite
+/data/*.jsonl
+/data/*.json
+/data/auto_fix_results.jsonl
+/data/auto_fix_state.db
+
+# Scripts and generated service examples
+scripts/*.service
